@@ -1,0 +1,360 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { Keypair, LAMPORTS_PER_SOL, SystemProgram } from "@solana/web3.js";
+import { DwdiPrograms } from "../target/types/dwdi_programs";
+import { waitForTransaction } from "../lib/helpers";
+import { PublicKey } from "@solana/web3.js";
+import { expect, it, describe } from "vitest";
+import {
+  createAssociatedTokenAccountInstruction,
+  createMint,
+  createSyncNativeInstruction,
+  getAssociatedTokenAddressSync,
+  getOrCreateAssociatedTokenAccount,
+  mintTo,
+  NATIVE_MINT,
+} from "@solana/spl-token";
+
+const BN = anchor.BN;
+
+describe("DWDI Raise Program", () => {
+  // TEST CONDITIONS
+  // DEFAULT_SIGNER is the owner of the curve contract
+  // USER1 is the creator of the curve
+  // USER2 is a random user that is not the creator of the curve
+  // Configure the client to use the local cluster.
+  anchor.setProvider(anchor.AnchorProvider.env());
+  const defaultSigner = anchor.AnchorProvider.env().wallet;
+  const connection = anchor.getProvider().connection;
+
+  const program = anchor.workspace.DwdiPrograms as Program<DwdiPrograms>;
+  const new_owner = Keypair.generate();
+  const feeReceiver = Keypair.generate();
+  const user1 = Keypair.generate();
+  const user2 = Keypair.generate();
+  const tokenNoVesting = Keypair.generate();
+  const tokenVesting = Keypair.generate();
+  let WSOLFeeReceiver: PublicKey;
+  let userCurveHolder; // user2 token wallet address
+  let userPlaceholderHolder; // user2 placeholder token wallet address
+
+  it("Is initialized!", async () => {
+    const airdrop_new_owner = await connection.requestAirdrop(
+      new_owner.publicKey,
+      LAMPORTS_PER_SOL
+    );
+    await waitForTransaction(connection, airdrop_new_owner);
+    const airdrop_user1 = await connection.requestAirdrop(
+      user1.publicKey,
+      LAMPORTS_PER_SOL
+    );
+    await waitForTransaction(connection, airdrop_user1);
+    const airdrop_user2 = await connection.requestAirdrop(
+      user2.publicKey,
+      5 * LAMPORTS_PER_SOL
+    );
+    await waitForTransaction(connection, airdrop_user2);
+    // Add your test here.
+    const tx = await program.methods
+      .initialize(feeReceiver.publicKey, new BN(0.1 * LAMPORTS_PER_SOL))
+      .rpc();
+    await waitForTransaction(connection, tx);
+    const globalInfoAccount = PublicKey.findProgramAddressSync(
+      [Buffer.from("global")],
+      program.programId
+    )[0];
+    const globalData = await program.account.globalInfo.fetch(
+      globalInfoAccount
+    );
+    // console.log("Global data", globalData);
+    expect(globalData.owner.equals(defaultSigner.publicKey));
+    expect(globalData.feeReceiver.equals(feeReceiver.publicKey));
+    expect(globalData.processingFee.toString()).to.equal(
+      (0.1 * LAMPORTS_PER_SOL).toString()
+    );
+    expect(globalData.platformFeeBasis.toString()).to.equal((10).toString());
+    expect(globalData.totalRaises.toString()).to.equal((0).toString());
+  });
+
+  const setupTokens = async () => {
+    WSOLFeeReceiver = (
+      await getOrCreateAssociatedTokenAccount(
+        connection,
+        user1,
+        NATIVE_MINT,
+        defaultSigner.publicKey
+      )
+    ).address;
+    await createMint(
+      connection,
+      user1,
+      user1.publicKey,
+      null,
+      9,
+      tokenNoVesting
+    );
+    await createMint(connection, user1, user1.publicKey, null, 9, tokenVesting);
+    const userTokenAccount = await getOrCreateAssociatedTokenAccount(
+      connection,
+      user1,
+      tokenNoVesting.publicKey,
+      user1.publicKey
+    );
+    const userTokenAccount2 = await getOrCreateAssociatedTokenAccount(
+      connection,
+      user1,
+      tokenVesting.publicKey,
+      user1.publicKey
+    );
+    const tx = await mintTo(
+      connection,
+      // only the payer of the transaction, doesn't really sign the mint authority
+      user1,
+      tokenNoVesting.publicKey,
+      userTokenAccount.address,
+      // Mint authority always needs to sign
+      user1,
+      1_000_000_000 * LAMPORTS_PER_SOL
+    ).catch((e) => {
+      console.log("Mint Error ", e);
+      throw e;
+    });
+
+    await waitForTransaction(connection, tx);
+    const tx2 = await mintTo(
+      connection,
+      user1,
+      tokenVesting.publicKey,
+      userTokenAccount2.address,
+      user1,
+      1_000_000_000 * LAMPORTS_PER_SOL
+    );
+    await waitForTransaction(connection, tx2);
+  };
+
+  describe("Creates a raise with Bonding Curve", () => {
+    let feeReceiverInitBalance;
+    it("sets up tokens", async () => {
+      await setupTokens();
+    });
+    it("creates the curve with selected params", async () => {
+      const user1NoVestingTokenHolder = getAssociatedTokenAddressSync(
+        tokenNoVesting.publicKey,
+        user1.publicKey
+      );
+      userCurveHolder = getAssociatedTokenAddressSync(
+        tokenNoVesting.publicKey,
+        user2.publicKey
+      );
+      feeReceiverInitBalance = await connection.getBalance(
+        feeReceiver.publicKey
+      );
+      const denominator = new BN(3).mul(new BN(1e15));
+      // Execute Method
+      const createCurveTx = await program.methods
+        .createCurve({
+          slopeNum: new BN(2),
+          slopeDen: denominator,
+          maxTxTokens: new BN(10000000).mul(new BN(LAMPORTS_PER_SOL)),
+          sellFee: new BN(10),
+          referralBasis: new BN(50),
+          // No Vesting Added
+          vestingBasis: new BN(0),
+          vestingInterval: new BN(0),
+          vestingStart: new BN(0),
+        })
+        .accounts({
+          signer: user1.publicKey,
+          feeReceiver: feeReceiver.publicKey,
+          signerCurveHolder: user1NoVestingTokenHolder,
+          curveToken: tokenNoVesting.publicKey,
+          reserveToken: NATIVE_MINT,
+        })
+        .signers([user1])
+        .rpc();
+      await waitForTransaction(connection, createCurveTx);
+      // Checks and Assertions
+      const curveAccount = PublicKey.findProgramAddressSync(
+        [Buffer.from("curve"), tokenNoVesting.publicKey.toBuffer()],
+        program.programId
+      )[0];
+      const placeholderMintToken = PublicKey.findProgramAddressSync(
+        [Buffer.from("placeholder"), tokenNoVesting.publicKey.toBuffer()],
+        program.programId
+      )[0];
+      userPlaceholderHolder = getAssociatedTokenAddressSync(
+        placeholderMintToken,
+        user2.publicKey
+      );
+      const curveData = await program.account.bondingCurve.fetch(curveAccount);
+      expect(curveData.dev.equals(user1.publicKey));
+      expect(curveData.sellFee.toString()).to.equal("10");
+      expect(curveData.platformFee.toString()).to.equal("10");
+      expect(curveData.referralBasis.toString()).to.equal("50");
+      expect(curveData.vestingBasis.toString()).to.equal("0");
+      expect(curveData.vestingInterval.toString()).to.equal("0");
+      expect(curveData.vestingStart.toString()).to.equal("0");
+      expect(curveData.slopeNumerator.toString()).to.equal("2");
+      expect(curveData.slopeDenominator.toString()).to.equal(
+        denominator.toString()
+      );
+    });
+
+    it.todo("Creates a raise account with vesting");
+
+    it("Transfers Minted token to curve token", async () => {
+      const curveHolderAccount = PublicKey.findProgramAddressSync(
+        [Buffer.from("curve_holder"), tokenNoVesting.publicKey.toBuffer()],
+        program.programId
+      )[0];
+      const holderBalance = await connection.getTokenAccountBalance(
+        curveHolderAccount
+      );
+      const ownerWallet = getAssociatedTokenAddressSync(
+        tokenNoVesting.publicKey,
+        user1.publicKey
+      );
+      const ownerBalance = await connection.getTokenAccountBalance(ownerWallet);
+      expect(holderBalance.value.uiAmount).to.equal(1_000_000_000);
+      expect(ownerBalance.value.uiAmount).to.equal(0);
+    });
+
+    it("Updates Global data", async () => {
+      const globalInfoAccount = PublicKey.findProgramAddressSync(
+        [Buffer.from("global")],
+        program.programId
+      )[0];
+      const globalData = await program.account.globalInfo.fetch(
+        globalInfoAccount
+      );
+      expect(globalData.totalRaises.toString()).to.equal("1");
+    });
+
+    it("Deducts platform fee from user to fee receiver", async () => {
+      const globalInfoAccount = PublicKey.findProgramAddressSync(
+        [Buffer.from("global")],
+        program.programId
+      )[0];
+      const globalData = await program.account.globalInfo.fetch(
+        globalInfoAccount
+      );
+      const postFeeReceiverBalance = await connection.getBalance(
+        feeReceiver.publicKey
+      );
+      expect(postFeeReceiverBalance - feeReceiverInitBalance).to.equal(
+        globalData.processingFee.toNumber()
+      );
+    });
+  });
+
+  const setupCurveNoVesting = async () => {
+    const user1NoVestingTokenHolder = getAssociatedTokenAddressSync(
+      tokenNoVesting.publicKey,
+      user1.publicKey
+    );
+    userCurveHolder = getAssociatedTokenAddressSync(
+      tokenNoVesting.publicKey,
+      user2.publicKey
+    );
+    const denominator = new BN(3).mul(new BN(1e15));
+    // Execute Method
+    const createCurveTx = await program.methods
+      .createCurve({
+        slopeNum: new BN(2),
+        slopeDen: denominator,
+        maxTxTokens: new BN(10000000).mul(new BN(LAMPORTS_PER_SOL)),
+        sellFee: new BN(10),
+        referralBasis: new BN(50),
+        // No Vesting Added
+        vestingBasis: new BN(0),
+        vestingInterval: new BN(0),
+        vestingStart: new BN(0),
+      })
+      .accounts({
+        signer: user1.publicKey,
+        feeReceiver: feeReceiver.publicKey,
+        signerCurveHolder: user1NoVestingTokenHolder,
+        curveToken: tokenNoVesting.publicKey,
+        reserveToken: NATIVE_MINT,
+      })
+      .signers([user1])
+      .rpc();
+    await waitForTransaction(connection, createCurveTx);
+  };
+
+  describe("Buys and Sells", () => {
+    // it("sets up env ", async () => {
+    //   await setupTokens();
+    //   await setupCurveNoVesting();
+    //   return true;
+    // });
+    it("Only OWNER allowed to BUY before initializing", async () => {
+      const buyAmount = 2 * LAMPORTS_PER_SOL;
+      // create WSOL for USER2
+      const user2WSOLWallet = getAssociatedTokenAddressSync(
+        NATIVE_MINT,
+        user2.publicKey
+      );
+      const ixs = [];
+      ixs.push(
+        createAssociatedTokenAccountInstruction(
+          user2.publicKey,
+          user2WSOLWallet,
+          user2.publicKey,
+          NATIVE_MINT
+        )
+      );
+      ixs.push(
+        SystemProgram.transfer({
+          fromPubkey: user2.publicKey,
+          toPubkey: user2WSOLWallet,
+          lamports: buyAmount,
+        })
+      );
+      ixs.push(createSyncNativeInstruction(user2WSOLWallet));
+      const tx = await program.methods
+        .buyOrSell(new BN(buyAmount), true)
+        .accounts({
+          signer: user2.publicKey,
+          curveToken: tokenNoVesting.publicKey,
+          reserveToken: NATIVE_MINT,
+          protocolFeeReceiver: WSOLFeeReceiver,
+        })
+        .preInstructions(ixs)
+        .signers([user2])
+        .rpc();
+      await waitForTransaction(connection, tx);
+
+      // Check that user2 WSOL balance decreased by 2SOL
+      const user2WSOLBalance = await connection.getTokenAccountBalance(
+        user2WSOLWallet
+      );
+      expect(user2WSOLBalance.value.uiAmount).to.equal(3);
+      // Check that reserve holder of WSOL increased by 2 WSOL
+      // Check that
+    });
+    it.todo("Buys tokens");
+
+    it.todo("On BUYS ONLY, sends referral fee to the referral address");
+
+    it.todo("Sells tokens");
+
+    it.todo("On SELLS ONLY, sell fee is stored in curve as JEET TEARS account");
+
+    it.todo("Ends raise when raise is sold out");
+  });
+  describe("Claiming", () => {
+    it.todo("If vesting exists, can claim only first cliff withdraw amount");
+
+    it.todo("On raise with sell tax, should claim jeet tears percentage");
+
+    it.todo(
+      "If vesting does not exist, cant claim, since tokens are already in wallet"
+    );
+  });
+  describe("Ending Raise", () => {
+    it.todo("If raise has existed for more than 30 days, dev can end");
+
+    it.todo("If dev ends the raise, all SOL is spread amongst token holders");
+  });
+});

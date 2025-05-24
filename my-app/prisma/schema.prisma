@@ -1,0 +1,111 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// @todo Add LIKES
+datasource db {
+  provider = "postgresql"
+  url      = env("POSTGRES_PRISMA_URL")
+}
+
+model loyalty_history {
+  id         Int       @id @default(autoincrement())
+  user_id    Int?
+  points     Int
+  action     String
+  type       String
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+  updated_at DateTime? @default(now()) @db.Timestamp(6)
+  users      users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "loyalty_history_user_id_users_id_fk")
+
+  @@index([user_id], map: "user_loyalty_idx")
+}
+
+model raises {
+  id                 Int         @id @default(autoincrement())
+  dev_id             Int?
+  token_mint_address String      @unique(map: "raises_token_mint_address_unique")
+  token_name         String
+  token_ticker       String
+  img_url            String
+  metadata_url       String
+  socials            String[]    @default([])
+  top_dev_time       DateTime?   @db.Timestamp(6)
+  created_at         DateTime?   @default(now()) @db.Timestamp(6)
+  updated_at         DateTime?   @default(now()) @db.Timestamp(6)
+  users              users?      @relation(fields: [dev_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "raises_dev_id_users_id_fk")
+  tags               tags[]
+  trades             trades[]
+  chats              raiseChat[]
+}
+
+model raiseChat {
+  id         Int       @id @default(autoincrement())
+  raise_id   Int
+  user_id    Int
+  message    String
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+  raise      raises?   @relation(fields: [raise_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "raise_chat_raise_id_raises_id_fk")
+  users      users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "raise_chat_user_id_users_id_fk")
+}
+
+model tags {
+  id         Int       @id @default(autoincrement())
+  type       String
+  proof      String
+  user_id    Int?
+  raise_id   Int?
+  accepted   Boolean   @default(false)
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+  updated_at DateTime? @default(now()) @db.Timestamp(6)
+  raises     raises?   @relation(fields: [raise_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "tags_raise_id_raises_id_fk")
+  users      users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "tags_user_id_users_id_fk")
+
+  @@index([raise_id], map: "raise_tags_idx")
+  @@index([user_id], map: "user_tags_idx")
+}
+
+model trades {
+  id         BigInt    @id @default(autoincrement())
+  user_id    Int?
+  raise_id   Int?
+  amount_in  BigInt
+  amount_out BigInt
+  // End price is 18 decimals even though SOL only allows 9, but that's the way the math works...
+  end_price  BigInt
+  type       String
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+  updated_at DateTime? @default(now()) @db.Timestamp(6)
+  raises     raises?   @relation(fields: [raise_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "trades_raise_id_raises_id_fk")
+  users      users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "trades_user_id_users_id_fk")
+
+  @@index([raise_id], map: "raise_trades_idx")
+  @@index([user_id], map: "user_trades_idx")
+}
+
+model txs_used {
+  id         BigInt    @id @default(autoincrement())
+  tx         String
+  action     String
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+}
+
+model users {
+  id                    Int               @id @default(autoincrement())
+  wallet                String            @unique(map: "users_wallet_unique")
+  username              String?           @unique
+  signature             String
+  last_update_signature String?
+  dev_points            Int               @default(0)
+  user_points           Int               @default(0)
+  created_at            DateTime?         @default(now()) @db.Timestamp(6)
+  updated_at            DateTime?         @default(now()) @db.Timestamp(6)
+  profile_img           String?           @unique(map: "users_profile_img_unique")
+  socials               String[]          @default([])
+  bio                   String?
+  loyalty_history       loyalty_history[]
+  raises                raises[]
+  tags                  tags[]
+  trades                trades[]
+  chats                 raiseChat[]
+}
